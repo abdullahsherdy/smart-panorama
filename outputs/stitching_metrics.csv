@@ -1,6 +1,6 @@
 pair_id,kp_a,kp_b,good_matches,stitched,time_sec,output,shape
 000002,574,4119,4,FAILED,0.86,,
-000003,380,378,217,OK,0.94,D:\Faculty\level four\CV\project\smart-panorama\outputs\panorama_002.jpg,545x532
-000004,553,430,33,OK,1.24,D:\Faculty\level four\CV\project\smart-panorama\outputs\panorama_003.jpg,1672x1183
-000005,1415,465,12,OK,1.03,D:\Faculty\level four\CV\project\smart-panorama\outputs\panorama_004.jpg,972x512
-000006,1423,1461,348,OK,1.27,D:\Faculty\level four\CV\project\smart-panorama\outputs\panorama_005.jpg,1065x970
+000003,380,378,217,OK,0.94,\outputs\panorama_002.jpg,545x532
+000004,553,430,33,OK,1.24,\outputs\panorama_003.jpg,1672x1183
+000005,1415,465,12,OK,1.03,outputs\panorama_004.jpg,972x512
+000006,1423,1461,348,OK,1.27,outputs\panorama_005.jpg,1065x970

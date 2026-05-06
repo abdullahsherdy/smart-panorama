@@ -34,6 +34,11 @@ from preprocess import run_batch
 from stitch import stitch_pair
 
 
+def _output_path_for_csv(abs_path: str) -> str:
+    """Repo-relative path using forward slashes (no machine-specific absolute paths)."""
+    return os.path.relpath(abs_path, _REPO_ROOT).replace("\\", "/")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline — Stages 1 → 4
 # ──────────────────────────────────────────────────────────────────────────────
@@ -176,7 +181,7 @@ def run_pipeline_stages(
     df = pd.DataFrame(rows)
     metrics_path = os.path.join(panorama_dir, "stitching_metrics.csv")
     df.to_csv(metrics_path, index=False)
-    print(f"\n[main] Metrics saved → {metrics_path}")
+    print(f"\n[main] Metrics saved → {_output_path_for_csv(metrics_path)}")
     return df, saved_paths
 
 
