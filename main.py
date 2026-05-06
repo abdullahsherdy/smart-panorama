@@ -169,7 +169,7 @@ def run_pipeline_stages(
                 "good_matches": len(good),
                 "stitched": "OK",
                 "time_sec": round(elapsed, 2),
-                "output": out_path,
+                "output": _output_path_for_csv(out_path),
                 "shape": f"{w}x{h}",
             }
         )
