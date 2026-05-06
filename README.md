@@ -1,4 +1,5 @@
 # Smart Panorama & Object Recognition System
+
 ## Full Implementation Plan — UDIS-D + PASCAL VOC 2012 Only
 
 ---
@@ -28,6 +29,7 @@ smart_panorama/
 ```
 
 **requirements.txt**
+
 ```
 opencv-python>=4.9.0
 numpy>=1.26.0
@@ -54,7 +56,6 @@ Pillow>=10.0.0
 **Output:** `(keypoints, descriptors)` — OpenCV format  
 **Dataset:** Preprocessed output from Stage 1
 
-
 ---
 
 ## Stage 3 — Feature Matching (`src/match.py`)
@@ -62,7 +63,6 @@ Pillow>=10.0.0
 **Input:** `(kp_a, des_a)` and `(kp_b, des_b)` from Stage 2  
 **Output:** `good_matches` list of `cv2.DMatch`  
 **Dataset:** UDIS-D pairs (via Stages 1+2)
-
 
 ---
 
@@ -120,3 +120,4 @@ python classify.py       # Stage 6 — saves outputs/confusion_*.png
 cd ..
 python main.py
 ```
+

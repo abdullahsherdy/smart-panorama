@@ -276,12 +276,13 @@ if __name__ == "__main__":
         input2_dir = args.input2,
         output_dir = args.output,
         max_pairs  = args.pairs,
-        save_npy   = not args.no_npy,
-    )
+        save_npy   = not args.no_npy
+        )
 
     if args.vis > 0:
         visualise_samples(results, n_samples=args.vis, output_dir=args.output)
 
+    # custom scenes preprocessing(cancelled)
     # if args.custom:
     #     preprocess_custom_scenes(args.custom, args.output)
 

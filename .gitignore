@@ -5,6 +5,7 @@ __pycache__/
 
 # datafies 
 data/ 
+plans/
 
 # C extensions
 *.so
