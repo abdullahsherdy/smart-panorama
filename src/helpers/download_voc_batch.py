@@ -46,6 +46,17 @@ DOWNLOAD_RETRY_BACKOFF_SEC = 5.0
 URL_OPEN_TIMEOUT_SEC = 600.0
 
 
+def _trainval_tar_request() -> urllib.request.Request:
+    return urllib.request.Request(
+        TRAINVAL_TAR_URL,
+        headers={
+            "User-Agent": "smart-panorama-voc-helper/1.0",
+            # Avoid gzip on long streams — some proxies mishandle truncation + decode.
+            "Accept-Encoding": "identity",
+        },
+    )
+
+
 def _is_transient_stream_error(e: BaseException) -> bool:
     if isinstance(e, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)):
         return True
@@ -119,10 +130,7 @@ def _download_trainval_tar_once(out_path: Path) -> None:
         "Downloading VOC trainval tar once (~2 GB) → "
         f"{out_path.relative_to(repo_root())} …"
     )
-    req = urllib.request.Request(
-        TRAINVAL_TAR_URL,
-        headers={"User-Agent": "smart-panorama-voc-helper/1.0"},
-    )
+    req = _trainval_tar_request()
     last_err: BaseException | None = None
     for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
         tmp_fd, tmp_name = tempfile.mkstemp(
@@ -220,10 +228,7 @@ def _extract_from_url_stream(dest: Path, wanted: set[str]) -> set[str]:
     if not remaining:
         return remaining
     dest.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(
-        TRAINVAL_TAR_URL,
-        headers={"User-Agent": "smart-panorama-voc-helper/1.0"},
-    )
+    req = _trainval_tar_request()
     last_err: BaseException | None = None
     for attempt in range(1, STREAM_RETRY_ATTEMPTS + 1):
         try:
@@ -263,15 +268,23 @@ def _extract_until_done(
     n_pass = MAX_TAR_PASSES_LOCAL if local_tar else MAX_TAR_PASSES_STREAM
     for attempt in range(1, n_pass + 1):
         if not missing:
-                    break
+            break
         print(f"    pass {attempt}/{n_pass} — {len(missing)} member(s) ({label}) …")
         if local_tar is not None:
             missing = _extract_from_local_tar(dest, missing, local_tar)
         else:
             missing = _extract_from_url_stream(dest, missing)
     if missing:
+        hint = ""
+        if local_tar is None:
+            hint = (
+                " Streaming over HTTPS is flaky on some networks; try "
+                "`python src/helpers/download_voc_batch.py --cache-tar` for one full download,"
+                " then rerun without streaming."
+            )
         raise RuntimeError(
-            f"{label}: still missing {len(missing)} paths. Example: {next(iter(missing))}"
+            f"{label}: still missing {len(missing)} paths. Example: {next(iter(missing))}."
+            f"{hint}"
         )
 
 
@@ -316,7 +329,7 @@ def download_voc_snippet(
     cache_tar
         If ``True``, download the trainval tarball to ``data/voc/_cache/`` and reuse it
         (saves bandwidth on reruns). If ``False`` (default), **only snippet files are written**
-        locally — the full `.tar` is **not saved**; extraction uses HTTP streaming (multiple
+        locally — the full `.tar` is **not saved**; extraction uses HTTPS streaming (multiple
         passes may still hit the Oxford server).
 
     Returns
@@ -326,7 +339,7 @@ def download_voc_snippet(
     root = resolve_dest(dest)
     print(f"VOC root: {root}")
     print(
-        "Mode: snippet only (streaming HTTP; **no full .tar saved**)"
+        "Mode: snippet only (streaming HTTPS; **no full .tar saved**)"
         if not cache_tar
         else "Mode: cache full tar under data/voc/_cache (--cache-tar)"
     )
