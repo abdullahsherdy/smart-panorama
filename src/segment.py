@@ -21,9 +21,10 @@ from PIL import Image
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SRC_DIR)
 
-# VOC snippet from `helpers/download_voc_v2.py` lives under repo `data/voc/…` (≤100 image IDs).
-VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOC2012_subset_300")
-VOC_EVAL_MAX_IMAGE_IDS = 300
+# Full PASCAL VOC 2012 trainval extracted under repo data/voc/VOCdevkit/...
+VOC_PROJECT_ROOT_REL = os.path.join(
+    "data", "voc", "VOCdevkit", "VOC2012_train_val", "VOC2012_train_val"
+)
 
 
 def _resolve_path(path: str) -> str:
@@ -372,13 +373,13 @@ def parse_args():
     p.add_argument(
         "--voc-root",
         default=VOC_PROJECT_ROOT_REL,
-        help="VOC2012 root (repo data/voc/VOC2012_subset_300).",
+        help="VOC2012 root (full trainval under data/voc/VOCdevkit/...).",
     )
     p.add_argument(
         "--voc-samples",
         type=int,
-        default=min(20, VOC_EVAL_MAX_IMAGE_IDS),
-        help=f"VOC images to segment / IoU (≤{VOC_EVAL_MAX_IMAGE_IDS}).",
+        default=500,
+        help="VOC images to segment / evaluate IoU on (use a large number for full set).",
     )
     p.add_argument("--run-two-datasets", action="store_true")
     return p.parse_args()
@@ -389,7 +390,7 @@ if __name__ == "__main__":
 
     output_dir = _resolve_path(args.output_dir)
     voc_root = _resolve_path(args.voc_root)
-    voc_samples = min(max(1, int(args.voc_samples)), VOC_EVAL_MAX_IMAGE_IDS)
+    voc_samples = max(1, int(args.voc_samples))
 
     print("=" * 55)
     print("  Stage 5 - Panorama Segmentation")
@@ -429,10 +430,13 @@ if __name__ == "__main__":
                 max_images=voc_samples,
                 prefix="voc",
             )
+
             voc_seg_csv = os.path.join(output_dir, "voc_segmentation_report.csv")
             voc_seg_df.to_csv(voc_seg_csv, index=False)
+
             print(f"[Stage 5] VOC segmentation done: {len(voc_seg_df)} images")
             print(f"[Stage 5] Saved VOC report      -> {voc_seg_csv}")
+
         except Exception as e:
             print(f"[Stage 5] VOC segmentation skipped: {e}")
 
@@ -461,14 +465,18 @@ if __name__ == "__main__":
         print(f"[Stage 5] Saved label mask      -> {out['label_mask']}")
         print(f"[Stage 5] Saved overlay         -> {out['overlay']}")
 
+
+    
     try:
-        iou_df = evaluate_on_voc_binary_iou(
+        iou_df = evaluate_on_voc_binary_i
+        ou(
             voc_root=voc_root,
             n_samples=voc_samples,
             n_segments=args.segments,
             spatial_weight=args.spatial_weight,
             background_mode=args.bg_mode,
         )
+
         if len(iou_df) > 0:
             mean_iou = float(iou_df["iou"].mean())
             iou_csv = os.path.join(output_dir, "voc_binary_iou.csv")
@@ -477,6 +485,7 @@ if __name__ == "__main__":
             print(f"[Stage 5] Saved IoU report    -> {iou_csv}")
         else:
             print("[Stage 5] VOC IoU skipped: no valid samples")
+    
     except Exception as e:
         print(f"[Stage 5] VOC IoU evaluation skipped: {e}")
 

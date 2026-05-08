@@ -3,11 +3,13 @@ Stage 6 - Object Classification
 ================================
 Input  : Object crop (np.ndarray BGR) from VOC bboxes or panorama segments
 Output : Predicted class label + confidence
-Dataset: PASCAL VOC 2012 (JPEGImages + Annotations XML)
+Dataset: PASCAL VOC 2012 trainval (JPEGImages + Annotations XML)
 
-Training uses LinearSVC (no Platt / probability) for speed.
-Confidence during normal inference = softmax over decision_function scores.
-Optional --demo-proba refits SVC(probability=True) on a small subset for true proba demo.
+Trains and benchmarks several classical classifiers on HOG + LAB-color
+features (Gaussian Naive Bayes, Logistic Regression, LinearSVC, RBF-SVC,
+Random Forest) and saves the best-scoring one as the final classifier.
+Confidence at inference time = softmax over decision_function scores
+(or predict_proba when natively available).
 """
 
 from __future__ import annotations
@@ -16,15 +18,17 @@ import argparse
 import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import joblib
 import numpy as np
 import pandas as pd
 from scipy.special import softmax
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import GaussianNB
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import LinearSVC, SVC
@@ -33,9 +37,10 @@ from skimage.feature import hog
 _SRC = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SRC)
 
-# Snippet VOC layout from `helpers/download_voc_v2.py` (≤100 trainval segmentation IDs).
-VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOC2012_subset_300")
-VOC_EVAL_MAX_IMAGE_IDS = 300
+# Full PASCAL VOC 2012 trainval extracted under repo data/voc/VOCdevkit/...
+VOC_PROJECT_ROOT_REL = os.path.join(
+    "data", "voc", "VOCdevkit", "VOC2012_train_val", "VOC2012_train_val"
+)
 
 
 def _resolve(path: str) -> str:
@@ -182,7 +187,9 @@ def collect_voc_crops(
 class ClassifierBundle:
     clf: Pipeline
     encoder: LabelEncoder
-    demo_svc: Optional[SVC] = None
+    name: str = ""
+    val_accuracy: float = 0.0
+    has_proba: bool = False
 
 
 def filter_rare_classes(
@@ -199,41 +206,116 @@ def filter_rare_classes(
     return X[mask], y[mask], meta_out
 
 
-def train_linear_svc(
-    X: np.ndarray,
-    y: np.ndarray,
-    C: float = 1.0,
-) -> Tuple[Pipeline, LabelEncoder]:
-    """Train StandardScaler + RBF SVC pipeline (better than LinearSVC on small data)."""
-    enc = LabelEncoder()
-    y_enc = enc.fit_transform(y)
-    clf = Pipeline(
-        steps=[
-            ("scaler", StandardScaler(with_mean=True)),
-            (
-                "svc",
-                SVC(
-                    kernel="rbf",
-                    C=max(1.0, float(C) * 8.0),
-                    gamma="scale",
-                    decision_function_shape="ovr",
-                    random_state=42,
-                ),
+def _candidate_pipelines(
+    C: float,
+    n_train: int,
+    rbf_max_samples: int = 6000,
+) -> List[Tuple[str, Pipeline, bool]]:
+    """
+    Return a list of (name, pipeline, has_proba) candidates to benchmark.
+
+    RBF-SVC scales O(n^2) so we skip it past `rbf_max_samples` to keep
+    training feasible on the full VOC trainval set.
+    """
+    cands: List[Tuple[str, Pipeline, bool]] = [
+        (
+            "gaussian_nb",
+            Pipeline([("scaler", StandardScaler(with_mean=True)), ("clf", GaussianNB())]),
+            True,
+        ),
+        (
+            "logreg",
+            Pipeline(
+                [
+                    ("scaler", StandardScaler(with_mean=True)),
+                    (
+                        "clf",
+                        LogisticRegression(
+                            C=float(C),
+                            solver="lbfgs",
+                            max_iter=2000,
+                            n_jobs=-1,
+                            random_state=42,
+                        ),
+                    ),
+                ]
             ),
-        ]
-    )
-    clf.fit(X, y_enc)
-    return clf, enc
+            True,
+        ),
+        (
+            "linear_svc",
+            Pipeline(
+                [
+                    ("scaler", StandardScaler(with_mean=True)),
+                    (
+                        "clf",
+                        LinearSVC(
+                            C=float(C),
+                            dual="auto",
+                            max_iter=5000,
+                            random_state=42,
+                        ),
+                    ),
+                ]
+            ),
+            False,
+        ),
+        (
+            "random_forest",
+            Pipeline(
+                [
+                    (
+                        "clf",
+                        RandomForestClassifier(
+                            n_estimators=300,
+                            n_jobs=-1,
+                            random_state=42,
+                        ),
+                    )
+                ]
+            ),
+            True,
+        ),
+    ]
+
+    if n_train <= rbf_max_samples:
+        cands.append(
+            (
+                "rbf_svc",
+                Pipeline(
+                    [
+                        ("scaler", StandardScaler(with_mean=True)),
+                        (
+                            "clf",
+                            SVC(
+                                kernel="rbf",
+                                C=max(1.0, float(C) * 8.0),
+                                gamma="scale",
+                                decision_function_shape="ovr",
+                                random_state=42,
+                            ),
+                        ),
+                    ]
+                ),
+                False,
+            )
+        )
+    return cands
 
 
-
-
-def predict_label_confidence(
+def _predict_with_pipeline(
     clf: Pipeline,
     encoder: LabelEncoder,
     X: np.ndarray,
+    has_proba: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Label + confidence from decision scores (softmax), no Platt scaling."""
+    """Label + confidence using predict_proba when available, else softmax(decision_function)."""
+    if has_proba and hasattr(clf, "predict_proba"):
+        prob = clf.predict_proba(X)
+        idx = np.argmax(prob, axis=1)
+        conf = prob[np.arange(len(idx)), idx]
+        classes = clf.classes_ if hasattr(clf, "classes_") else clf.named_steps["clf"].classes_
+        return encoder.inverse_transform(classes[idx]), conf.astype(np.float64)
     scores = clf.decision_function(X)
     if scores.ndim == 1:
         scores = np.column_stack([-scores, scores])
@@ -243,38 +325,51 @@ def predict_label_confidence(
     return encoder.inverse_transform(idx), conf.astype(np.float64)
 
 
-def fit_demo_proba_svc(
-    X: np.ndarray,
-    y_enc: np.ndarray,
-    max_samples: int = 2500,
-    random_state: int = 42,
-) -> SVC:
-    """Small subset + RBF SVC with probability=True for demo only (slower)."""
-    rng = np.random.default_rng(random_state)
-    n = len(X)
-    if n > max_samples:
-        idx = rng.choice(n, size=max_samples, replace=False)
-        Xs, ys = X[idx], y_enc[idx]
-    else:
-        Xs, ys = X, y_enc
-    return SVC(
-        kernel="rbf",
-        C=1.0,
-        gamma="scale",
-        probability=True,
-        random_state=random_state,
-    ).fit(Xs, ys)
-
-
-def predict_demo_proba(
-    demo_svc: SVC,
+def benchmark_and_select_best(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     encoder: LabelEncoder,
+    C: float = 1.0,
+) -> Tuple[ClassifierBundle, pd.DataFrame]:
+    """Train every candidate, return the best (by val accuracy) plus a leaderboard."""
+    y_train_enc = encoder.transform(y_train)
+    leaderboard: List[Dict[str, object]] = []
+    best: Optional[ClassifierBundle] = None
+
+    for name, pipe, has_proba in _candidate_pipelines(C=C, n_train=len(X_train)):
+        
+        try:
+            print(f"[Stage 6]   - training '{name}' on {len(X_train)} samples...")
+            pipe.fit(X_train, y_train_enc)
+            pred, _ = _predict_with_pipeline(pipe, encoder, X_val, has_proba=has_proba)
+            acc = float(accuracy_score(y_val, pred))
+        except Exception as e:
+            print(f"[Stage 6]     '{name}' failed: {e}")
+            leaderboard.append({"classifier": name, "val_accuracy": float("nan"), "note": str(e)})
+            continue
+
+        leaderboard.append({"classifier": name, "val_accuracy": round(acc, 4), "note": ""})
+
+        print(f"[Stage 6]     '{name}' val accuracy = {acc:.4f}")
+        
+        if best is None or acc > best.val_accuracy:
+            best = ClassifierBundle(
+                clf=pipe, encoder=encoder, name=name, val_accuracy=acc, has_proba=has_proba
+            )
+
+    if best is None:
+        raise RuntimeError("All candidate classifiers failed to train.")
+    return best, pd.DataFrame(leaderboard).sort_values("val_accuracy", ascending=False)
+
+
+def predict_label_confidence(
+    bundle: ClassifierBundle,
     X: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    prob = demo_svc.predict_proba(X)
-    idx = np.argmax(prob, axis=1)
-    conf = prob[np.arange(len(idx)), idx]
-    return encoder.inverse_transform(demo_svc.classes_[idx]), conf.astype(np.float64)
+    """Label + confidence using the selected best classifier."""
+    return _predict_with_pipeline(bundle.clf, bundle.encoder, X, has_proba=bundle.has_proba)
 
 
 def crops_from_panorama_segments(
@@ -327,17 +422,17 @@ def _find_train_val_lists(voc_root: str) -> Tuple[str, str]:
 def run_stage6(
     voc_root: str,
     output_dir: str,
-    max_train_crops: int = 8000,
-    max_val_crops: int = 2000,
+    max_train_crops: Optional[int] = None,
+    max_val_crops: Optional[int] = None,
     C: float = 1.0,
-    demo_proba: bool = False,
-    demo_proba_samples: int = 2500,
     panorama_paths: Optional[List[str]] = None,
     pano_segments: int = 6,
     panorama_limit: int = 1,
 ) -> None:
     """
-    Stage 6 pipeline (callable from main). ``voc_root`` and ``output_dir`` should be absolute paths.
+    Stage 6 pipeline (callable from main). Trains and benchmarks several
+    classical classifiers on VOC trainval crops, picks the best by validation
+    accuracy, and saves it to disk.
     """
     voc_root = os.path.abspath(voc_root)
     output_dir = os.path.abspath(output_dir)
@@ -348,43 +443,56 @@ def run_stage6(
             "Extract Annotations from the official VOC trainval tar."
         )
 
-    cap = VOC_EVAL_MAX_IMAGE_IDS
-    all_ids: List[str] = []
+    train_ids: List[str] = []
+    val_ids: List[str] = []
     try:
         train_list, val_list = _find_train_val_lists(voc_root)
-        all_ids = read_image_list(train_list)
-        if train_list != val_list:
-            all_ids += [i for i in read_image_list(val_list) if i not in set(all_ids)]
+        train_ids = read_image_list(train_list)
+        val_ids = read_image_list(val_list) if val_list != train_list else []
     except FileNotFoundError:
         pass
-    if not all_ids:
-        ann_dir = os.path.join(voc_root, "Annotations")
+
+    if not train_ids and not val_ids:
         all_ids = sorted(
             os.path.splitext(f)[0] for f in os.listdir(ann_dir) if f.endswith(".xml")
         )
-        print(f"[Stage 6] ImageSets empty; using {len(all_ids)} IDs from Annotations folder.")
-    if len(all_ids) > cap:
-        all_ids = all_ids[:cap]
-        print(f"[Stage 6] Capping VOC image IDs to project snippet (<={cap}).")
-    print(f"[Stage 6] Pooled {len(all_ids)} VOC IDs; splitting IDs 80/20 then collecting crops.")
+        print(f"[Stage 6] ImageSets missing; using {len(all_ids)} IDs from Annotations folder.")
+        rng = np.random.default_rng(42)
+        ids_arr = np.array(all_ids)
+        rng.shuffle(ids_arr)
+        cut = max(1, int(round(len(ids_arr) * 0.8)))
+        train_ids = ids_arr[:cut].tolist()
+        val_ids = ids_arr[cut:].tolist()
+    elif not val_ids:
+        rng = np.random.default_rng(42)
+        ids_arr = np.array(train_ids)
+        rng.shuffle(ids_arr)
+        cut = max(1, int(round(len(ids_arr) * 0.8)))
+        train_ids = ids_arr[:cut].tolist()
+        val_ids = ids_arr[cut:].tolist()
 
-    rng = np.random.default_rng(42)
-    ids_arr = np.array(all_ids)
-    rng.shuffle(ids_arr)
-    cut = max(1, int(round(len(ids_arr) * 0.8)))
-    train_ids = ids_arr[:cut].tolist()
-    val_ids = ids_arr[cut:].tolist()
+    print(
+        f"[Stage 6] VOC trainval IDs -> train: {len(train_ids)}, val: {len(val_ids)} "
+        f"(from {voc_root})."
+    )
 
-    print(f"[Stage 6] Collecting up to {max_train_crops} train crops (with flip aug)...")
+    print(
+        f"[Stage 6] Collecting train crops"
+        f"{f' (cap {max_train_crops})' if max_train_crops else ''} with flip aug..."
+    )
     X_train, y_train, meta_train = collect_voc_crops(
         voc_root, train_ids, max_crops=max_train_crops, augment_flip=True
     )
-    print(f"[Stage 6] Collecting up to {max_val_crops} val crops...")
+
+    print(
+        f"[Stage 6] Collecting val crops"
+        f"{f' (cap {max_val_crops})' if max_val_crops else ''}...")
     X_val, y_val, meta_val = collect_voc_crops(
         voc_root, val_ids, max_crops=max_val_crops, augment_flip=False
     )
 
     X_train, y_train, meta_train = filter_rare_classes(X_train, y_train, meta_train, min_count=3)
+
     keep_classes = set(np.unique(y_train).tolist())
     val_mask = np.array([lbl in keep_classes for lbl in y_val])
     X_val, y_val = X_val[val_mask], y_val[val_mask]
@@ -394,25 +502,26 @@ def run_stage6(
         f"Val: {X_val.shape[0]} crops"
     )
 
-    clf, enc = train_linear_svc(X_train, y_train, C=C)
-    bundle = ClassifierBundle(clf=clf, encoder=enc, demo_svc=None)
+    enc = LabelEncoder()
+    enc.fit(np.concatenate([y_train, y_val]) if len(y_val) else y_train)
+
+    print("[Stage 6] Benchmarking candidate classifiers (best for this domain wins)...")
+    best, leaderboard = benchmark_and_select_best(
+        X_train, y_train, X_val, y_val, encoder=enc, C=C
+    )
 
     os.makedirs(output_dir, exist_ok=True)
+    leaderboard_path = os.path.join(output_dir, "classifier_leaderboard.csv")
+    leaderboard.to_csv(leaderboard_path, index=False)
+    print(f"[Stage 6] Leaderboard saved -> {leaderboard_path}")
+    print(leaderboard.to_string(index=False))
+    print(
+        f"[Stage 6] Best classifier: '{best.name}' "
+        f"with val accuracy = {best.val_accuracy:.4f}"
+    )
 
-    if demo_proba:
-        print(f"[Stage 6] Fitting demo SVC(probability=True) on <= {demo_proba_samples} samples...")
-        y_enc_train = enc.transform(y_train)
-        bundle.demo_svc = fit_demo_proba_svc(
-            X_train, y_enc_train, max_samples=demo_proba_samples
-        )
-
-    if bundle.demo_svc is not None:
-        pred, conf = predict_demo_proba(bundle.demo_svc, enc, X_val)
-    else:
-        pred, conf = predict_label_confidence(clf, enc, X_val)
-
-    acc = accuracy_score(y_val, pred)
-    print(f"[Stage 6] Val accuracy: {acc:.4f}")
+    pred, conf = predict_label_confidence(best, X_val)
+    print("[Stage 6] Detailed report for best classifier:")
     print(classification_report(y_val, pred, zero_division=0))
 
     rows = []
@@ -425,17 +534,21 @@ def run_stage6(
                 "meta": meta_val[i] if i < len(meta_val) else "",
             }
         )
-    df = pd.DataFrame(rows)
-    csv_path = os.path.join(output_dir, "classification_val.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"[Stage 6] Saved -> {csv_path}")
+    pd.DataFrame(rows).to_csv(os.path.join(output_dir, "classification_val.csv"), index=False)
+    print(f"[Stage 6] Per-sample predictions saved -> classification_val.csv")
 
     model_path = os.path.join(output_dir, "classifier_stage6.joblib")
     joblib.dump(
-        {"linear_svc": clf, "encoder": enc, "demo_svc": bundle.demo_svc},
+        {
+            "best_name": best.name,
+            "val_accuracy": best.val_accuracy,
+            "has_proba": best.has_proba,
+            "pipeline": best.clf,
+            "encoder": best.encoder,
+        },
         model_path,
     )
-    print(f"[Stage 6] Model saved -> {model_path}")
+    print(f"[Stage 6] Final classifier saved -> {model_path}")
 
     if panorama_paths:
         from segment import segment_image_kmeans
@@ -453,23 +566,19 @@ def run_stage6(
                 continue
             print(f"[Stage 6] Panorama segment predictions ({os.path.basename(pano_path)}):")
             Xp = np.vstack([extract_hog_from_bgr(c) for c in crops])
-            if bundle.demo_svc is not None:
-                plab, pconf = predict_demo_proba(bundle.demo_svc, enc, Xp)
-            else:
-                plab, pconf = predict_label_confidence(clf, enc, Xp)
+            plab, pconf = predict_label_confidence(best, Xp)
             for i, (lab, co) in enumerate(zip(plab, pconf)):
                 print(f"  segment[{i}]: {lab}  (conf={co:.3f})")
 
 
 def run_stage6_cli(args: argparse.Namespace) -> None:
+    
     run_stage6(
         voc_root=_resolve(args.voc_root),
         output_dir=_resolve(args.output_dir),
-        max_train_crops=args.max_train_crops,
-        max_val_crops=args.max_val_crops,
+        max_train_crops=args.max_train_crops if args.max_train_crops and args.max_train_crops > 0 else None,
+        max_val_crops=args.max_val_crops if args.max_val_crops and args.max_val_crops > 0 else None,
         C=args.C,
-        demo_proba=args.demo_proba,
-        demo_proba_samples=args.demo_proba_samples,
         panorama_paths=[_resolve(args.panorama)] if args.panorama else None,
         pano_segments=args.pano_segments,
         panorama_limit=1,
@@ -477,18 +586,24 @@ def run_stage6_cli(args: argparse.Namespace) -> None:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Stage 6 - VOC object classification (HOG + SVM)")
+    p = argparse.ArgumentParser(
+        description="Stage 6 - VOC object classification (HOG + color, classifier benchmark)"
+    )
     p.add_argument("--voc-root", default=VOC_PROJECT_ROOT_REL)
     p.add_argument("--output-dir", default="outputs/classification")
-    p.add_argument("--max-train-crops", type=int, default=8000, help="Cap training crops for speed")
-    p.add_argument("--max-val-crops", type=int, default=2000)
-    p.add_argument("--C", type=float, default=1.0, help="LinearSVC regularization")
     p.add_argument(
-        "--demo-proba",
-        action="store_true",
-        help="After fast LinearSVC, fit SVC(probability=True) on a small subset for demo",
+        "--max-train-crops",
+        type=int,
+        default=0,
+        help="Cap training crops for memory/speed. 0 (default) = use all.",
     )
-    p.add_argument("--demo-proba-samples", type=int, default=2500)
+    p.add_argument(
+        "--max-val-crops",
+        type=int,
+        default=0,
+        help="Cap validation crops. 0 (default) = use all.",
+    )
+    p.add_argument("--C", type=float, default=1.0, help="Regularization for SVC/LogReg")
     p.add_argument("--panorama", default=None, help="Optional panorama path for segment-based demo")
     p.add_argument("--pano-segments", type=int, default=6)
     return p.parse_args()
