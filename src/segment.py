@@ -301,11 +301,18 @@ def evaluate_on_voc_binary_iou(
     pairs = pairs[: max(1, int(n_samples))]
     rows: List[Dict[str, object]] = []
 
+    skipped_masks = 0
     for stem, jpg_path, gt_path in pairs:
         img = cv2.imread(jpg_path)
         if img is None:
             continue
-        gt = _read_voc_mask_indices(gt_path)
+        try:
+            if os.path.getsize(gt_path) == 0:
+                raise ValueError("empty mask file")
+            gt = _read_voc_mask_indices(gt_path)
+        except Exception:
+            skipped_masks += 1
+            continue
         if gt.shape[:2] != img.shape[:2]:
             gt = cv2.resize(gt, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
 
@@ -320,6 +327,8 @@ def evaluate_on_voc_binary_iou(
         iou = _binary_iou(pred_fg, gt_fg)
         rows.append({"id": stem, "iou": round(iou, 4)})
 
+    if skipped_masks:
+        print(f"[Stage 5] VOC IoU: skipped {skipped_masks} unreadable/empty mask(s).")
     return pd.DataFrame(rows)
 
 
