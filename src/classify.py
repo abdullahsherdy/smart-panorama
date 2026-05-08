@@ -31,6 +31,10 @@ from skimage.feature import hog
 _SRC = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SRC)
 
+# Snippet VOC layout from `helpers/download_voc_v2.py` (≤100 trainval segmentation IDs).
+VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOCdevkit", "VOC2012")
+VOC_EVAL_MAX_IMAGE_IDS = 100
+
 
 def _resolve(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(_REPO_ROOT, path)
@@ -289,11 +293,22 @@ def run_stage6(
     if train_list == val_list:
         print("[Stage 6] Using single list; splitting 80/20 by stem order for train/val.")
         all_ids = read_image_list(train_list)
+        cap = VOC_EVAL_MAX_IMAGE_IDS
+        if len(all_ids) > cap:
+            all_ids = all_ids[:cap]
+            print(f"[Stage 6] Capping VOC image IDs to project snippet (≤{cap}).")
         cut = int(len(all_ids) * 0.8)
         train_ids, val_ids = all_ids[:cut], all_ids[cut:]
     else:
         train_ids = read_image_list(train_list)
         val_ids = read_image_list(val_list) if os.path.isfile(val_list) else train_ids[:500]
+        cap = VOC_EVAL_MAX_IMAGE_IDS
+        if len(train_ids) > cap:
+            train_ids = train_ids[:cap]
+            print(f"[Stage 6] Capping VOC train IDs to ≤{cap}.")
+        if len(val_ids) > cap:
+            val_ids = val_ids[:cap]
+            print(f"[Stage 6] Capping VOC val IDs to ≤{cap}.")
 
     print(f"[Stage 6] Collecting up to {max_train_crops} train crops...")
     X_train, y_train, _ = collect_voc_crops(voc_root, train_ids, max_crops=max_train_crops)
@@ -386,7 +401,7 @@ def run_stage6_cli(args: argparse.Namespace) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Stage 6 - VOC object classification (HOG + SVM)")
-    p.add_argument("--voc-root", default="../data/voc/VOCdevkit/VOC2012")
+    p.add_argument("--voc-root", default=VOC_PROJECT_ROOT_REL)
     p.add_argument("--output-dir", default="outputs/classification")
     p.add_argument("--max-train-crops", type=int, default=8000, help="Cap training crops for speed")
     p.add_argument("--max-val-crops", type=int, default=2000)

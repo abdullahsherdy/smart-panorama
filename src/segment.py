@@ -21,6 +21,10 @@ from PIL import Image
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SRC_DIR)
 
+# VOC snippet from `helpers/download_voc_v2.py` lives under repo `data/voc/…` (≤100 image IDs).
+VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOCdevkit", "VOC2012")
+VOC_EVAL_MAX_IMAGE_IDS = 100
+
 
 def _resolve_path(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(_REPO_ROOT, path)
@@ -328,10 +332,15 @@ def parse_args():
     p.add_argument("--bg-mode", default="border", choices=["border", "largest"])
     p.add_argument(
         "--voc-root",
-        default="../data/voc/VOCdevkit/VOC2012",
-        help="VOC2012 root after extracting official trainval tar", 
-        )
-    p.add_argument("--voc-samples", type=int, default=20)
+        default=VOC_PROJECT_ROOT_REL,
+        help="VOC2012 root (repo data/voc/VOCdevkit/VOC2012 after download_voc_v2).",
+    )
+    p.add_argument(
+        "--voc-samples",
+        type=int,
+        default=min(20, VOC_EVAL_MAX_IMAGE_IDS),
+        help=f"VOC images to segment / IoU (≤{VOC_EVAL_MAX_IMAGE_IDS}).",
+    )
     p.add_argument("--run-two-datasets", action="store_true")
     return p.parse_args()
 
@@ -341,6 +350,7 @@ if __name__ == "__main__":
 
     output_dir = _resolve_path(args.output_dir)
     voc_root = _resolve_path(args.voc_root)
+    voc_samples = min(max(1, int(args.voc_samples)), VOC_EVAL_MAX_IMAGE_IDS)
 
     print("=" * 55)
     print("  Stage 5 - Panorama Segmentation")
@@ -377,7 +387,7 @@ if __name__ == "__main__":
                 output_dir=os.path.join(output_dir, "voc_dataset"),
                 n_segments=args.segments,
                 spatial_weight=args.spatial_weight,
-                max_images=args.voc_samples,
+                max_images=voc_samples,
                 prefix="voc",
             )
             voc_seg_csv = os.path.join(output_dir, "voc_segmentation_report.csv")
@@ -401,7 +411,7 @@ if __name__ == "__main__":
     try:
         iou_df = evaluate_on_voc_binary_iou(
             voc_root=voc_root,
-            n_samples=args.voc_samples,
+            n_samples=voc_samples,
             n_segments=args.segments,
             spatial_weight=args.spatial_weight,
             background_mode=args.bg_mode,
