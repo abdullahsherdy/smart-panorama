@@ -22,8 +22,8 @@ _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SRC_DIR)
 
 # VOC snippet from `helpers/download_voc_v2.py` lives under repo `data/voc/…` (≤100 image IDs).
-VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOCdevkit", "VOC2012")
-VOC_EVAL_MAX_IMAGE_IDS = 100
+VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOC2012_subset_300")
+VOC_EVAL_MAX_IMAGE_IDS = 300
 
 
 def _resolve_path(path: str) -> str:
@@ -191,7 +191,10 @@ def segment_panorama_file(
     }
 
 
-def _background_cluster_from_border(label_mask: np.ndarray, border_frac: float = 0.06) -> int:
+def _background_clusters_from_border(
+    label_mask: np.ndarray, border_frac: float = 0.06, ratio: float = 0.5
+) -> List[int]:
+    """Return all clusters whose pixel share on the image border is >= ``ratio``."""
     h, w = label_mask.shape[:2]
     t = max(1, int(round(min(h, w) * border_frac)))
     border = np.zeros((h, w), dtype=bool)
@@ -199,9 +202,20 @@ def _background_cluster_from_border(label_mask: np.ndarray, border_frac: float =
     border[-t:, :] = True
     border[:, :t] = True
     border[:, -t:] = True
-    border_labels = label_mask[border].reshape(-1)
-    counts = np.bincount(border_labels, minlength=int(label_mask.max()) + 1)
-    return int(np.argmax(counts))
+
+    n_clusters = int(label_mask.max()) + 1
+    border_counts = np.bincount(label_mask[border].reshape(-1), minlength=n_clusters)
+    total_counts = np.bincount(label_mask.reshape(-1), minlength=n_clusters)
+
+    bg = []
+    for cid in range(n_clusters):
+        if total_counts[cid] == 0:
+            continue
+        if border_counts[cid] / float(total_counts[cid]) >= ratio:
+            bg.append(cid)
+    if not bg:
+        bg.append(int(np.argmax(border_counts)))
+    return bg
 
 
 def _cleanup_binary_mask(mask: np.ndarray, ksize: int = 5) -> np.ndarray:
@@ -212,18 +226,34 @@ def _cleanup_binary_mask(mask: np.ndarray, ksize: int = 5) -> np.ndarray:
     return cleaned.astype(np.uint8)
 
 
+def _keep_large_components(mask: np.ndarray, min_area_frac: float = 0.005) -> np.ndarray:
+    """Drop tiny connected components (< ``min_area_frac`` of image area)."""
+    h, w = mask.shape[:2]
+    min_area = max(50, int(round(h * w * min_area_frac)))
+    n_labels, lbls, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    keep = np.zeros_like(mask, dtype=np.uint8)
+    for cid in range(1, n_labels):
+        if stats[cid, cv2.CC_STAT_AREA] >= min_area:
+            keep[lbls == cid] = 1
+    return keep
+
+
 def _foreground_from_clusters(label_mask: np.ndarray, background_mode: str = "border") -> np.ndarray:
     mode = background_mode.strip().lower()
     if mode == "border":
-        bg = _background_cluster_from_border(label_mask)
+        bg_ids = _background_clusters_from_border(label_mask)
+        fg = np.ones_like(label_mask, dtype=np.uint8)
+        for bg in bg_ids:
+            fg[label_mask == bg] = 0
     elif mode == "largest":
         flat = label_mask.reshape(-1)
         counts = np.bincount(flat, minlength=int(label_mask.max()) + 1)
         bg = int(np.argmax(counts))
+        fg = (label_mask != bg).astype(np.uint8)
     else:
         raise ValueError(f"Unknown background_mode: {background_mode}")
-    fg = (label_mask != bg).astype(np.uint8)
-    return _cleanup_binary_mask(fg, ksize=5)
+    fg = _cleanup_binary_mask(fg, ksize=5)
+    return _keep_large_components(fg, min_area_frac=0.005)
 
 
 def _binary_iou(pred: np.ndarray, gt: np.ndarray) -> float:
@@ -333,7 +363,7 @@ def parse_args():
     p.add_argument(
         "--voc-root",
         default=VOC_PROJECT_ROOT_REL,
-        help="VOC2012 root (repo data/voc/VOCdevkit/VOC2012 after download_voc_v2).",
+        help="VOC2012 root (repo data/voc/VOC2012_subset_300).",
     )
     p.add_argument(
         "--voc-samples",
@@ -398,8 +428,22 @@ if __name__ == "__main__":
             print(f"[Stage 5] VOC segmentation skipped: {e}")
 
     else:
+        panorama_path = _resolve_path(args.panorama)
+        if not os.path.isfile(panorama_path):
+            pano_dir = _resolve_path(args.panorama_dir)
+            candidates = sorted(glob.glob(os.path.join(pano_dir, "panorama_*.jpg")))
+            if not candidates:
+                raise FileNotFoundError(
+                    f"Panorama not found: {panorama_path} (and no panorama_*.jpg in {pano_dir})"
+                )
+            print(
+                f"[Stage 5] {os.path.basename(panorama_path)} missing; "
+                f"using {os.path.basename(candidates[0])} instead."
+            )
+            panorama_path = candidates[0]
+
         out = segment_panorama_file(
-            panorama_path=_resolve_path(args.panorama),
+            panorama_path=panorama_path,
             output_dir=output_dir,
             n_segments=args.segments,
             spatial_weight=args.spatial_weight,

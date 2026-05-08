@@ -24,7 +24,9 @@ import numpy as np
 import pandas as pd
 from scipy.special import softmax
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import LinearSVC, SVC
 from skimage.feature import hog
 
@@ -32,28 +34,39 @@ _SRC = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SRC)
 
 # Snippet VOC layout from `helpers/download_voc_v2.py` (≤100 trainval segmentation IDs).
-VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOCdevkit", "VOC2012")
-VOC_EVAL_MAX_IMAGE_IDS = 100
+VOC_PROJECT_ROOT_REL = os.path.join("data", "voc", "VOC2012_subset_300")
+VOC_EVAL_MAX_IMAGE_IDS = 300
 
 
 def _resolve(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(_REPO_ROOT, path)
 
 
+def _color_hist_lab(bgr: np.ndarray, bins: int = 8) -> np.ndarray:
+    """Normalized 3D LAB color histogram (bins^3 dims)."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    hist = cv2.calcHist([lab], [0, 1, 2], None, [bins, bins, bins],
+                        [0, 256, 0, 256, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten().astype(np.float32)
+
+
 def extract_hog_from_bgr(bgr: np.ndarray, resize: int = 128) -> np.ndarray:
-    """Fixed-size HOG descriptor from a BGR crop."""
+    """HOG (gray) + LAB color histogram features from a BGR crop."""
     if bgr is None or bgr.size == 0:
         raise ValueError("Empty crop")
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (resize, resize), interpolation=cv2.INTER_AREA)
-    return hog(
+    resized = cv2.resize(bgr, (resize, resize), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    hog_feat = hog(
         gray,
         orientations=9,
-        pixels_per_cell=(16, 16),
+        pixels_per_cell=(8, 8),
         cells_per_block=(2, 2),
         block_norm="L2-Hys",
         feature_vector=True,
-    )
+    ).astype(np.float32)
+    color_feat = _color_hist_lab(resized, bins=6)
+    return np.concatenate([hog_feat, color_feat]).astype(np.float32)
 
 
 def parse_voc_xml(xml_path: str) -> Tuple[str, List[Tuple[str, int, int, int, int]]]:
@@ -98,6 +111,7 @@ def collect_voc_crops(
     voc_root: str,
     image_ids: Sequence[str],
     max_crops: Optional[int] = None,
+    augment_flip: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Build feature matrix X and labels y (strings) from VOC crops.
@@ -133,7 +147,13 @@ def collect_voc_crops(
             ymax = max(0, min(ymax, h))
             if xmax <= xmin + 2 or ymax <= ymin + 2:
                 continue
-            crop = img[ymin:ymax, xmin:xmax]
+            pad_x = int(round((xmax - xmin) * 0.05))
+            pad_y = int(round((ymax - ymin) * 0.05))
+            xs0 = max(0, xmin - pad_x)
+            ys0 = max(0, ymin - pad_y)
+            xs1 = min(w, xmax + pad_x)
+            ys1 = min(h, ymax + pad_y)
+            crop = img[ys0:ys1, xs0:xs1]
             if crop.size == 0 or crop.shape[0] * crop.shape[1] < 400:
                 continue
             try:
@@ -144,6 +164,14 @@ def collect_voc_crops(
             labels.append(cls)
             meta.append(f"{stem}:{cls}")
             n += 1
+            if augment_flip:
+                try:
+                    fvec_f = extract_hog_from_bgr(cv2.flip(crop, 1))
+                    feats.append(fvec_f)
+                    labels.append(cls)
+                    meta.append(f"{stem}:{cls}#flip")
+                except Exception:
+                    pass
 
     if not feats:
         raise RuntimeError("No VOC crops collected. Check voc_root and ImageSets.")
@@ -152,25 +180,56 @@ def collect_voc_crops(
 
 @dataclass
 class ClassifierBundle:
-    clf: LinearSVC
+    clf: Pipeline
     encoder: LabelEncoder
     demo_svc: Optional[SVC] = None
+
+
+def filter_rare_classes(
+    X: np.ndarray,
+    y: np.ndarray,
+    meta: Optional[List[str]] = None,
+    min_count: int = 3,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Drop classes with < ``min_count`` samples (helps stratified split + SVM)."""
+    classes, counts = np.unique(y, return_counts=True)
+    keep = set(classes[counts >= min_count].tolist())
+    mask = np.array([lbl in keep for lbl in y])
+    meta_out = [m for m, k in zip(meta or [], mask) if k] if meta is not None else []
+    return X[mask], y[mask], meta_out
 
 
 def train_linear_svc(
     X: np.ndarray,
     y: np.ndarray,
     C: float = 1.0,
-) -> Tuple[LinearSVC, LabelEncoder]:
+) -> Tuple[Pipeline, LabelEncoder]:
+    """Train StandardScaler + RBF SVC pipeline (better than LinearSVC on small data)."""
     enc = LabelEncoder()
     y_enc = enc.fit_transform(y)
-    clf = LinearSVC(C=C, max_iter=5000, dual=False, random_state=42)
+    clf = Pipeline(
+        steps=[
+            ("scaler", StandardScaler(with_mean=True)),
+            (
+                "svc",
+                SVC(
+                    kernel="rbf",
+                    C=max(1.0, float(C) * 8.0),
+                    gamma="scale",
+                    decision_function_shape="ovr",
+                    random_state=42,
+                ),
+            ),
+        ]
+    )
     clf.fit(X, y_enc)
     return clf, enc
 
 
+
+
 def predict_label_confidence(
-    clf: LinearSVC,
+    clf: Pipeline,
     encoder: LabelEncoder,
     X: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -289,30 +348,51 @@ def run_stage6(
             "Extract Annotations from the official VOC trainval tar."
         )
 
-    train_list, val_list = _find_train_val_lists(voc_root)
-    if train_list == val_list:
-        print("[Stage 6] Using single list; splitting 80/20 by stem order for train/val.")
+    cap = VOC_EVAL_MAX_IMAGE_IDS
+    all_ids: List[str] = []
+    try:
+        train_list, val_list = _find_train_val_lists(voc_root)
         all_ids = read_image_list(train_list)
-        cap = VOC_EVAL_MAX_IMAGE_IDS
-        if len(all_ids) > cap:
-            all_ids = all_ids[:cap]
-            print(f"[Stage 6] Capping VOC image IDs to project snippet (≤{cap}).")
-        cut = int(len(all_ids) * 0.8)
-        train_ids, val_ids = all_ids[:cut], all_ids[cut:]
-    else:
-        train_ids = read_image_list(train_list)
-        val_ids = read_image_list(val_list) if os.path.isfile(val_list) else train_ids[:500]
-        cap = VOC_EVAL_MAX_IMAGE_IDS
-        if len(train_ids) > cap:
-            train_ids = train_ids[:cap]
-            print(f"[Stage 6] Capping VOC train IDs to ≤{cap}.")
-        if len(val_ids) > cap:
-            val_ids = val_ids[:cap]
-            print(f"[Stage 6] Capping VOC val IDs to ≤{cap}.")
+        if train_list != val_list:
+            all_ids += [i for i in read_image_list(val_list) if i not in set(all_ids)]
+    except FileNotFoundError:
+        pass
+    if not all_ids:
+        ann_dir = os.path.join(voc_root, "Annotations")
+        all_ids = sorted(
+            os.path.splitext(f)[0] for f in os.listdir(ann_dir) if f.endswith(".xml")
+        )
+        print(f"[Stage 6] ImageSets empty; using {len(all_ids)} IDs from Annotations folder.")
+    if len(all_ids) > cap:
+        all_ids = all_ids[:cap]
+        print(f"[Stage 6] Capping VOC image IDs to project snippet (<={cap}).")
+    print(f"[Stage 6] Pooled {len(all_ids)} VOC IDs; splitting IDs 80/20 then collecting crops.")
 
-    print(f"[Stage 6] Collecting up to {max_train_crops} train crops...")
-    X_train, y_train, _ = collect_voc_crops(voc_root, train_ids, max_crops=max_train_crops)
-    print(f"[Stage 6] Train: {X_train.shape[0]} crops, {len(np.unique(y_train))} classes")
+    rng = np.random.default_rng(42)
+    ids_arr = np.array(all_ids)
+    rng.shuffle(ids_arr)
+    cut = max(1, int(round(len(ids_arr) * 0.8)))
+    train_ids = ids_arr[:cut].tolist()
+    val_ids = ids_arr[cut:].tolist()
+
+    print(f"[Stage 6] Collecting up to {max_train_crops} train crops (with flip aug)...")
+    X_train, y_train, meta_train = collect_voc_crops(
+        voc_root, train_ids, max_crops=max_train_crops, augment_flip=True
+    )
+    print(f"[Stage 6] Collecting up to {max_val_crops} val crops...")
+    X_val, y_val, meta_val = collect_voc_crops(
+        voc_root, val_ids, max_crops=max_val_crops, augment_flip=False
+    )
+
+    X_train, y_train, meta_train = filter_rare_classes(X_train, y_train, meta_train, min_count=3)
+    keep_classes = set(np.unique(y_train).tolist())
+    val_mask = np.array([lbl in keep_classes for lbl in y_val])
+    X_val, y_val = X_val[val_mask], y_val[val_mask]
+    meta_val = [m for m, k in zip(meta_val, val_mask) if k]
+    print(
+        f"[Stage 6] Train: {X_train.shape[0]} crops, {len(np.unique(y_train))} classes | "
+        f"Val: {X_val.shape[0]} crops"
+    )
 
     clf, enc = train_linear_svc(X_train, y_train, C=C)
     bundle = ClassifierBundle(clf=clf, encoder=enc, demo_svc=None)
@@ -325,9 +405,6 @@ def run_stage6(
         bundle.demo_svc = fit_demo_proba_svc(
             X_train, y_enc_train, max_samples=demo_proba_samples
         )
-
-    print(f"[Stage 6] Collecting up to {max_val_crops} val crops...")
-    X_val, y_val, meta_val = collect_voc_crops(voc_root, val_ids, max_crops=max_val_crops)
 
     if bundle.demo_svc is not None:
         pred, conf = predict_demo_proba(bundle.demo_svc, enc, X_val)
