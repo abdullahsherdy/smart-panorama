@@ -1,300 +1,485 @@
-# download_voc_v2.py
-# Minimal VOC2012 downloader (teammate flow): stream official trainval tar once per pass,
-# extract only Segmentation trainval list + up to N image triples:
-# JPEGImages, Annotations, SegmentationClass.
-#
-# Output layout (always under repo `data/voc/`, regardless of cwd):
-#   data/voc/VOCdevkit/VOC2012/{JPEGImages,Annotations,SegmentationClass,ImageSets/Segmentation}
-#
-# Stages 5–6 (`segment.py`, `classify.py`) expect voc_root =
-# `<repo>/data/voc/VOCdevkit/VOC2012`.
+"""
+download_voc.py
+================
+
+Faster, resumable VOC2012 downloader.
+
+What it does
+------------
+1. Downloads the official VOC2012 trainval tar (~2 GB) from Oxford **once**, into
+   ``data/voc/_cache/VOCtrainval_11-May-2012.tar``:
+
+   - Uses HTTP ``Range`` requests to resume on disconnect (no 2 GB redo).
+   - Optional multi-connection parallel download (``--connections``) for speed
+     on slow / single-stream-throttled links.
+
+2. Extracts the requested subset locally from the cached tar (random-access,
+   near-instant) into a standard VOC layout that ``segment.py`` and
+   ``classify.py`` consume:
+
+       <dest>/
+         JPEGImages/<id>.jpg
+         Annotations/<id>.xml
+         SegmentationClass/<id>.png   (only IDs in Segmentation list)
+         ImageSets/Main/{train,val,trainval}.txt
+         ImageSets/Segmentation/{train,val,trainval}.txt
+
+Common usage
+------------
+Get everything (recommended for max classification accuracy)::
+
+    python src/helpers/download_voc.py --max-images 0
+
+Subset, say first 1000 IDs from the segmentation trainval list::
+
+    python src/helpers/download_voc.py --max-images 1000 --ids-list seg
+
+Use a tar you already have (skip download)::
+
+    python src/helpers/download_voc.py --tar-path D:/path/to/VOCtrainval.tar
+"""
 
 from __future__ import annotations
 
 import argparse
-import errno
-import http.client
-import json
-import ssl
+import shutil
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import List, Optional, Set, Tuple
 
-BASE = "http://host.robots.ox.ac.uk/pascal/VOC/voc2012"
-VOC_TAR_URL = f"{BASE}/VOCtrainval_11-May-2012.tar"
-SEG_LIST_MEMBER = "VOCdevkit/VOC2012/ImageSets/Segmentation/trainval.txt"
+VOC_TAR_URL = (
+    "http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar"
+)
+TAR_FILENAME = "VOCtrainval_11-May-2012.tar"
+USER_AGENT = "smart-panorama-voc/3.0"
 
-# Project cap: VOC snippet size for classify + segment pipelines.
-PROJECT_MAX_SNIPPET_IMAGES = 100
-MAX_TAR_PASSES = 3
-
-# urllib ``timeout`` is one number for the underlying socket on this platform/build.
-# A modest value (e.g. 600) applies to blocking reads — tarfile can idle long while skipping
-# a ~2 GB stream → spurious TimeoutError. Use a very large ceiling (days) for this one-shot
-# Oxford download so slow links can finish; TCP still fails fast on true disconnects.
-TAR_STREAM_SOCKET_TIMEOUT_SEC = 7 * 24 * 3600.0
-
-STREAM_OP_MAX_RETRIES = 10
-STREAM_OP_BACKOFF_SEC = 4.0
+INNER_VOC_PREFIX = "VOCdevkit/VOC2012"
 
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _norm_member(name: str) -> str:
-    return name.replace("\\", "/")
+def _resolve_under_repo(path: str | Path) -> Path:
+    p = Path(path)
+    return p.resolve() if p.is_absolute() else (repo_root() / p).resolve()
 
 
-def _safe_extract(tar: tarfile.TarFile, member: tarfile.TarInfo, dest: str) -> None:
-    if sys.version_info >= (3, 12):
-        tar.extract(member, dest, filter="data")  # type: ignore[call-arg]
-    else:
-        tar.extract(member, dest)
+def _request(url: str, headers: Optional[dict] = None) -> urllib.request.Request:
+    h = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
+    if headers:
+        h.update(headers)
+    return urllib.request.Request(url, headers=h)
 
 
-def _trainval_tar_request() -> urllib.request.Request:
-    return urllib.request.Request(
-        VOC_TAR_URL,
-        headers={
-            "User-Agent": "smart-panorama-voc-v2/2.1",
-            "Accept-Encoding": "identity",
-        },
-    )
+def _head_content_length(url: str) -> Tuple[int, bool]:
+    """Return (content_length, supports_ranges) via HEAD."""
+    req = _request(url)
+    req.method = "HEAD"  # type: ignore[attr-defined]
+    with urllib.request.urlopen(req, timeout=60) as r:
+        size = int(r.headers.get("Content-Length", "0") or 0)
+        accept = (r.headers.get("Accept-Ranges", "") or "").lower()
+    return size, accept == "bytes"
 
 
-def _urlopen_trainval() -> object:
-    req = _trainval_tar_request()
-    return urllib.request.urlopen(req, timeout=TAR_STREAM_SOCKET_TIMEOUT_SEC)
+def _format_mb(n: int) -> str:
+    return f"{n / (1024 * 1024):8.1f} MB"
 
 
-def _is_transient_stream_error(e: BaseException) -> bool:
-    if isinstance(e, (TimeoutError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
-        return True
-    if isinstance(e, tarfile.ReadError):
-        return True
-    if isinstance(e, ssl.SSLError):
-        return True
-    if isinstance(e, http.client.IncompleteRead):
-        return True
-    rd = getattr(http.client, "RemoteDisconnected", None)
-    if rd is not None and isinstance(e, rd):
-        return True
-    if isinstance(e, urllib.error.URLError):
-        return True
-    if isinstance(e, urllib.error.HTTPError):
-        return e.code in (408, 425, 429) or e.code >= 500
-    if isinstance(e, OSError):
-        w = getattr(e, "winerror", None)
-        if w in (10054, 10053, 10060, 10061):
-            return True
-        en = getattr(e, "errno", None)
-        return en in (errno.ECONNRESET, errno.ETIMEDOUT, errno.EPIPE, errno.ECONNABORTED)
-    return False
+# ---------- Downloader ----------------------------------------------------- #
 
 
-def resolve_voc_bundle_root(dest: str | Path | None) -> Path:
-    """Directory that contains (or will contain) ``VOCdevkit/`` — default ``<repo>/data/voc``."""
-    if dest is None:
-        return repo_root() / "data" / "voc"
-    p = Path(dest)
-    return p.resolve() if p.is_absolute() else (repo_root() / p)
+class _ProgressTracker:
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self.start = time.time()
+        self.lock = threading.Lock()
+        self._last_print = 0.0
+
+    def add(self, n: int) -> None:
+        with self.lock:
+            self.done += n
+            now = time.time()
+            if now - self._last_print >= 1.0 or self.done >= self.total:
+                self._last_print = now
+                self._print()
+
+    def _print(self) -> None:
+        elapsed = max(1e-3, time.time() - self.start)
+        speed = self.done / elapsed
+        remaining = max(0, self.total - self.done)
+        eta = remaining / speed if speed > 0 else 0
+        pct = 100.0 * self.done / max(1, self.total)
+        sys.stdout.write(
+            f"\r  [{pct:5.1f}%] {_format_mb(self.done)}/{_format_mb(self.total)}"
+            f"  {speed/1024/1024:5.2f} MB/s  ETA {eta:6.0f}s "
+        )
+        sys.stdout.flush()
 
 
-def extract_trainval_list_if_missing(bundle: Path) -> None:
-    target = bundle / SEG_LIST_MEMBER
-    if target.is_file():
+def _download_range(
+    url: str,
+    start: int,
+    end_inclusive: int,
+    dest: Path,
+    progress: _ProgressTracker,
+    max_retries: int = 8,
+) -> None:
+    """Download ``[start, end_inclusive]`` into ``dest`` at offset ``start``.
+
+    Resumes from whatever bytes are already on disk for this range.
+    """
+    have = 0
+    if dest.exists():
+        size = dest.stat().st_size
+        if start <= size <= end_inclusive + 1:
+            have = size - start
+        elif size > end_inclusive + 1:
+            have = end_inclusive + 1 - start
+    if have > 0:
+        progress.add(have)
+    if start + have > end_inclusive:
         return
-    print("Extract Segmentation/trainval.txt (streaming VOC trainval tar)...")
-    bundle.mkdir(parents=True, exist_ok=True)
-    last_err: BaseException | None = None
-    for attempt in range(1, STREAM_OP_MAX_RETRIES + 1):
+
+    backoff = 2.0
+    for attempt in range(1, max_retries + 1):
         try:
-            with _urlopen_trainval() as response:
-                with tarfile.open(fileobj=response, mode="r|") as tar:
-                    for member in tar:
-                        if _norm_member(member.name) == SEG_LIST_MEMBER:
-                            _safe_extract(tar, member, str(bundle))
-                            print(f"  wrote {SEG_LIST_MEMBER}")
-                            return
-            raise RuntimeError("Reached end of tar without finding trainval.txt.")
-        except Exception as e:
-            last_err = e
-            if isinstance(e, RuntimeError) and "Reached end of tar" in str(e):
+            req = _request(
+                url,
+                headers={"Range": f"bytes={start + have}-{end_inclusive}"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp, open(
+                dest, "r+b"
+            ) as f:
+                f.seek(start + have)
+                while True:
+                    chunk = resp.read(1024 * 256)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    have += len(chunk)
+                    progress.add(len(chunk))
+            return
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            if attempt == max_retries:
                 raise
-            if not _is_transient_stream_error(e):
-                raise
-            wait = min(STREAM_OP_BACKOFF_SEC * (2 ** (attempt - 1)), 120.0)
-            print(
-                f"  trainval list stream failed ({e.__class__.__name__}); "
-                f"retry {attempt}/{STREAM_OP_MAX_RETRIES} in {wait:.0f}s …"
+            wait = min(backoff, 60.0)
+            sys.stdout.write(
+                f"\n  range [{start}-{end_inclusive}] retry {attempt}/{max_retries} "
+                f"({e.__class__.__name__}); wait {wait:.0f}s\n"
             )
             time.sleep(wait)
-    assert last_err is not None
-    raise last_err
+            backoff *= 2
 
 
-def read_seg_trainval_ids(voc2012: Path, max_images: int) -> list[str]:
-    seg_list = voc2012 / "ImageSets" / "Segmentation" / "trainval.txt"
-    if not seg_list.is_file():
-        raise FileNotFoundError(f"Missing {seg_list}")
-    ids = [
-        ln.strip()
-        for ln in seg_list.read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-    effective = PROJECT_MAX_SNIPPET_IMAGES
-    if max_images > 0:
-        effective = min(max_images, PROJECT_MAX_SNIPPET_IMAGES)
-    elif max_images < 0:
-        raise ValueError("--max-images must be ≥ 0")
-    return ids[:effective]
+def _ensure_sparse_file(path: Path, size: int) -> None:
+    """Create or extend ``path`` to ``size`` bytes (truncate if larger)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        with open(path, "wb") as f:
+            f.truncate(size)
+        return
+    cur = path.stat().st_size
+    if cur < size:
+        with open(path, "r+b") as f:
+            f.truncate(size)
+    elif cur > size:
+        with open(path, "r+b") as f:
+            f.truncate(size)
 
 
-def download_seg_subset(bundle: Path, max_images: int) -> Path:
-    
+def download_tar(
+    cache_path: Path, connections: int = 8, url: str = VOC_TAR_URL
+) -> Path:
+    """Download (or resume) the VOC trainval tar to ``cache_path``."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Probing tar size: {url}")
+    total, supports_ranges = _head_content_length(url)
+    if total <= 0:
+        raise RuntimeError("Server did not return a usable Content-Length.")
+    print(f"Tar size: {_format_mb(total)}  (Range support: {supports_ranges})")
+
+    if cache_path.exists() and cache_path.stat().st_size == total:
+        print(f"Tar already cached: {cache_path}")
+        return cache_path
+
+    if not supports_ranges:
+        connections = 1
+        print("Server does not advertise Range support; falling back to 1 stream.")
+
+    _ensure_sparse_file(cache_path, total)
+
+    n = max(1, int(connections))
+    chunk = total // n
+    ranges: List[Tuple[int, int]] = []
+    for i in range(n):
+        s = i * chunk
+        e = (s + chunk - 1) if i < n - 1 else (total - 1)
+        ranges.append((s, e))
+
+    progress = _ProgressTracker(total)
+    print(f"Downloading with {n} connection(s)...")
+    if n == 1:
+        s, e = ranges[0]
+        _download_range(url, s, e, cache_path, progress)
+    else:
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futures = [
+                ex.submit(_download_range, url, s, e, cache_path, progress)
+                for s, e in ranges
+            ]
+            for fut in as_completed(futures):
+                fut.result()
+    print()  # newline after progress
+
+    actual = cache_path.stat().st_size
+    if actual != total:
+        raise RuntimeError(
+            f"Downloaded size mismatch: got {actual}, expected {total}. "
+            f"Re-run to resume."
+        )
+    print(f"Tar download OK -> {cache_path}")
+    return cache_path
+
+
+# ---------- Extraction ----------------------------------------------------- #
+
+
+def _read_id_list(tar: tarfile.TarFile, member_name: str) -> List[str]:
+    try:
+        m = tar.getmember(member_name)
+    except KeyError:
+        return []
+    f = tar.extractfile(m)
+    if f is None:
+        return []
+    text = f.read().decode("utf-8", errors="ignore")
+    return [ln.split()[0].strip() for ln in text.splitlines() if ln.strip()]
+
+
+def _safe_extract(
+    tar: tarfile.TarFile, member: tarfile.TarInfo, dest_path: Path
+) -> None:
+    """Extract a single member's *content* to ``dest_path`` (renaming the path)."""
+    src = tar.extractfile(member)
+    if src is None:
+        return
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(src, out, length=1024 * 256)
+
+
+def _filter_existing(members_to_paths: dict, force: bool) -> dict:
+    if force:
+        return members_to_paths
+    return {m: p for m, p in members_to_paths.items() if not p.is_file() or p.stat().st_size == 0}
+
+
+def extract_subset(
+    tar_path: Path,
+    dest: Path,
+    max_images: int,
+    ids_list: str = "seg",
+    with_jpeg: bool = True,
+    with_xml: bool = True,
+    with_mask: bool = True,
+    force: bool = False,
+) -> dict:
     """
-    Download JPEG + VOC XML annotation + SegmentationClass mask per ID (subset of Segmentation/trainval).
+    Extract a subset of VOC2012 from a cached tar to ``<dest>/`` in flat layout.
 
     Parameters
     ----------
-    bundle
-        e.g. ``<repo>/data/voc`` — **not** the inner VOC2012 folder.
+    ids_list
+        ``"seg"`` (Segmentation/trainval.txt, ~2913 IDs with masks),
+        ``"main"`` (Main/trainval.txt, ~17125 IDs, no masks needed),
+        ``"all"``  (union of both).
     max_images
-        At least 1, at most :data:`PROJECT_MAX_SNIPPET_IMAGES` when positive.
-        ``0`` is treated like "use full project cap" (same as ``100``).
+        ``0`` or negative → no cap (all IDs from the chosen list).
     """
-    
-    extract_trainval_list_if_missing(bundle)
-    voc2012 = bundle / "VOCdevkit" / "VOC2012"
-    ids = read_seg_trainval_ids(voc2012, max_images=max_images)
+    dest.mkdir(parents=True, exist_ok=True)
 
-    needed: set[str] = set()
-    for i in ids:
-        needed.add(f"VOCdevkit/VOC2012/JPEGImages/{i}.jpg")
-        needed.add(f"VOCdevkit/VOC2012/Annotations/{i}.xml")
-        needed.add(f"VOCdevkit/VOC2012/SegmentationClass/{i}.png")
-    needed.add(SEG_LIST_MEMBER)
-
-    bundle.mkdir(parents=True, exist_ok=True)
-    (voc2012 / "JPEGImages").mkdir(parents=True, exist_ok=True)
-    (voc2012 / "Annotations").mkdir(parents=True, exist_ok=True)
-    (voc2012 / "SegmentationClass").mkdir(parents=True, exist_ok=True)
-
-    total_need = len(needed)
-    print(
-        f"Streaming VOC tar — extracting {len(ids)} image(s) × 3 + list "
-        f"({total_need} tar member(s)); up to {MAX_TAR_PASSES} pass(es)..."
-    )
-
-    for pass_no in range(1, MAX_TAR_PASSES + 1):
-        if not needed:
-            break
-        stream_ok = False
-        last_err: BaseException | None = None
-        for attempt in range(1, STREAM_OP_MAX_RETRIES + 1):
-            try:
-                with _urlopen_trainval() as response:
-                    with tarfile.open(fileobj=response, mode="r|") as tar:
-                        last_report = len(needed)
-                        for member in tar:
-                            name = _norm_member(member.name)
-                            if name not in needed:
-                                continue
-                            try:
-                                _safe_extract(tar, member, str(bundle))
-                            except Exception:
-                                rel = bundle / name
-                                if rel.is_file():
-                                    rel.unlink()
-                                raise
-                            needed.discard(name)
-                            remain = len(needed)
-                            if (
-                                remain
-                                and (remain != last_report)
-                                and remain % 50 == 0
-                            ):
-                                print(f"  … {remain} tar member(s) left")
-                                last_report = remain
-                            if not needed:
-                                break
-                stream_ok = True
-                break
-            except Exception as e:
-                last_err = e
-                if not _is_transient_stream_error(e):
-                    raise
-                wait = min(STREAM_OP_BACKOFF_SEC * (2 ** (attempt - 1)), 120.0)
-                print(
-                    f"  pass {pass_no} stream retry {attempt}/{STREAM_OP_MAX_RETRIES} "
-                    f"({e.__class__.__name__}), wait {wait:.0f}s …"
-                )
-                time.sleep(wait)
-        if not stream_ok:
-            assert last_err is not None
-            raise last_err
-        print(
-            f"  pass {pass_no}/{MAX_TAR_PASSES}: {len(needed)} tar member(s) remaining"
+    print(f"Opening cached tar: {tar_path}")
+    with tarfile.open(tar_path, mode="r") as tar:
+        seg_trainval = _read_id_list(
+            tar, f"{INNER_VOC_PREFIX}/ImageSets/Segmentation/trainval.txt"
+        )
+        main_trainval = _read_id_list(
+            tar, f"{INNER_VOC_PREFIX}/ImageSets/Main/trainval.txt"
         )
 
-    if needed:
-        ex = sorted(needed)[:8]
-        raise RuntimeError(f"Still missing {len(needed)} path(s). Examples: {ex}")
+        if ids_list == "seg":
+            ids = list(seg_trainval)
+        elif ids_list == "main":
+            ids = list(main_trainval)
+        elif ids_list == "all":
+            seen: Set[str] = set()
+            ids = []
+            for s in seg_trainval + main_trainval:
+                if s not in seen:
+                    seen.add(s)
+                    ids.append(s)
+        else:
+            raise ValueError(f"Unknown ids_list: {ids_list}")
 
-    manifest = bundle / "_download_manifest_v2.json"
-    manifest.write_text(
-        json.dumps(
-            {"n_ids": len(ids), "image_ids": ids, "voc2012_relpath": "VOCdevkit/VOC2012"},
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+        if not ids:
+            raise RuntimeError(
+                f"ID list '{ids_list}' is empty. The tar may be incomplete."
+            )
 
-    print("Done. ")
-    print(f"  JPEGs -> {voc2012 / 'JPEGImages'}")
-    print(f"  Masks -> {voc2012 / 'SegmentationClass'}")
-    print(f"  XMLs  -> {voc2012 / 'Annotations'}")
-    print(f"  manifest -> {manifest}")
-    return bundle
+        if max_images and max_images > 0:
+            ids = ids[:max_images]
+        seg_id_set = set(seg_trainval)
+
+        print(f"Selected {len(ids)} ID(s) from list='{ids_list}'.")
+        print(
+            f"  with_jpeg={with_jpeg} with_xml={with_xml} "
+            f"with_mask={with_mask} force={force}"
+        )
+
+        # Always copy ImageSets/* into dest so downstream tools can read them.
+        list_files = [
+            "ImageSets/Main/train.txt",
+            "ImageSets/Main/val.txt",
+            "ImageSets/Main/trainval.txt",
+            "ImageSets/Segmentation/train.txt",
+            "ImageSets/Segmentation/val.txt",
+            "ImageSets/Segmentation/trainval.txt",
+        ]
+        wanted: dict = {}
+        for rel in list_files:
+            wanted[f"{INNER_VOC_PREFIX}/{rel}"] = dest / rel
+
+        for stem in ids:
+            if with_jpeg:
+                wanted[f"{INNER_VOC_PREFIX}/JPEGImages/{stem}.jpg"] = (
+                    dest / "JPEGImages" / f"{stem}.jpg"
+                )
+            if with_xml:
+                wanted[f"{INNER_VOC_PREFIX}/Annotations/{stem}.xml"] = (
+                    dest / "Annotations" / f"{stem}.xml"
+                )
+            if with_mask and stem in seg_id_set:
+                wanted[f"{INNER_VOC_PREFIX}/SegmentationClass/{stem}.png"] = (
+                    dest / "SegmentationClass" / f"{stem}.png"
+                )
+
+        wanted = _filter_existing(wanted, force=force)
+        total = len(wanted)
+        if total == 0:
+            print("Nothing to extract (all targets already exist).")
+            return {"ids": ids, "extracted": 0}
+
+        print(f"Extracting {total} file(s) ...")
+        done = 0
+        last_print = time.time()
+        names = list(wanted.keys())
+        for member_name in names:
+            try:
+                m = tar.getmember(member_name)
+            except KeyError:
+                continue
+            _safe_extract(tar, m, wanted[member_name])
+            done += 1
+            now = time.time()
+            if now - last_print >= 1.0 or done == total:
+                last_print = now
+                pct = 100.0 * done / total
+                sys.stdout.write(f"\r  [{pct:5.1f}%] {done}/{total}")
+                sys.stdout.flush()
+        print()
+        print(f"Extracted {done}/{total} files into {dest}")
+        return {"ids": ids, "extracted": done}
+
+
+# ---------- CLI ------------------------------------------------------------ #
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Download ≤100 VOC2012 segmentation IDs (JPEG+XML+mask) into data/voc."
+        description=(
+            "Cache VOC2012 trainval tar (resumable, parallel) and extract a subset "
+            "into a flat VOC layout consumed by segment.py / classify.py."
+        )
     )
-
-    # dest 
     p.add_argument(
         "--dest",
-        type=str,
-        default=str((repo_root() / "data" / "voc").relative_to(repo_root())),
-        help="Path relative to repo root; default data/voc (contains VOCdevkit/).",
+        default="data/voc/VOC2012_subset_300",
+        help="Output VOC root (flat layout). Default: data/voc/VOC2012_subset_300",
     )
-
-    # max-images number
+    p.add_argument(
+        "--cache-dir",
+        default="data/voc/_cache",
+        help="Where to keep the downloaded tar. Default: data/voc/_cache",
+    )
+    p.add_argument(
+        "--tar-path",
+        default=None,
+        help="Use an existing tar on disk instead of downloading.",
+    )
     p.add_argument(
         "--max-images",
         type=int,
-        default=PROJECT_MAX_SNIPPET_IMAGES,
-        help=f"Subset size (cap {PROJECT_MAX_SNIPPET_IMAGES}). Use 0 for cap-only default.",
+        default=0,
+        help="Cap on number of IDs (0 = use the entire chosen list).",
     )
-
+    p.add_argument(
+        "--ids-list",
+        choices=("seg", "main", "all"),
+        default="seg",
+        help=(
+            "Which list to draw IDs from. "
+            "seg = Segmentation/trainval (~2913 IDs, has masks). "
+            "main = Main/trainval (~17125 IDs, no masks). "
+            "all = union."
+        ),
+    )
+    p.add_argument("--connections", type=int, default=8, help="Parallel HTTP streams.")
+    p.add_argument("--no-jpeg", action="store_true", help="Skip JPEGImages.")
+    p.add_argument("--no-xml", action="store_true", help="Skip Annotations XML.")
+    p.add_argument("--no-mask", action="store_true", help="Skip SegmentationClass.")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing destination files.",
+    )
     return p.parse_args()
 
 
-if __name__ == "__main__":
-    a = parse_args()
-    bundle = resolve_voc_bundle_root(a.dest)
-    mi = a.max_images
+def main() -> None:
+    args = parse_args()
+    dest = _resolve_under_repo(args.dest)
 
-    if mi <= 0:
-        mi = PROJECT_MAX_SNIPPET_IMAGES
+    if args.tar_path:
+        tar_path = _resolve_under_repo(args.tar_path)
+        if not tar_path.is_file():
+            raise FileNotFoundError(f"--tar-path not found: {tar_path}")
+        print(f"Using existing tar: {tar_path}")
     else:
-        mi = min(mi, PROJECT_MAX_SNIPPET_IMAGES)
+        cache_dir = _resolve_under_repo(args.cache_dir)
+        tar_path = cache_dir / TAR_FILENAME
+        download_tar(tar_path, connections=max(1, int(args.connections)))
 
-    print(f"VOC bundle root (absolute): {bundle}")
-    download_seg_subset(bundle, max_images=mi)
+    print(f"Destination: {dest}")
+    extract_subset(
+        tar_path=tar_path,
+        dest=dest,
+        max_images=args.max_images,
+        ids_list=args.ids_list,
+        with_jpeg=not args.no_jpeg,
+        with_xml=not args.no_xml,
+        with_mask=not args.no_mask,
+        force=args.force,
+    )
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
