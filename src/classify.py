@@ -209,6 +209,7 @@ def _candidate_pipelines(
     C: float,
     n_train: int,
     rbf_max_samples: int = 6000,
+    skip: Optional[Sequence[str]] = None,
 ) -> List[Tuple[str, Pipeline, bool]]:
     """
     Return a list of (name, pipeline, has_proba) candidates to benchmark.
@@ -216,6 +217,7 @@ def _candidate_pipelines(
     RBF-SVC scales O(n^2) so we skip it past `rbf_max_samples` to keep
     training feasible on the full VOC trainval set.
     """
+    skip_set = set(skip or [])
     cands: List[Tuple[str, Pipeline, bool]] = [
         (
             "gaussian_nb",
@@ -250,8 +252,14 @@ def _candidate_pipelines(
                         "clf",
                         LinearSVC(
                             C=float(C),
-                            dual="auto",
-                            max_iter=5000,
+                            # Primal is dramatically faster when n_samples > n_features
+                            # (true for VOC trainval: ~25k samples vs ~8.3k features).
+                            # "auto" can still pick dual on some sklearn versions, so be explicit.
+                            dual=False,
+                            loss="squared_hinge",
+                            tol=1e-3,
+                            max_iter=2000,
+                            verbose=1,
                             random_state=42,
                         ),
                     ),
@@ -299,6 +307,7 @@ def _candidate_pipelines(
                 False,
             )
         )
+    cands = [c for c in cands if c[0] not in skip_set]
     return cands
 
 
@@ -331,13 +340,14 @@ def benchmark_and_select_best(
     y_val: np.ndarray,
     encoder: LabelEncoder,
     C: float = 1.0,
+    skip: Optional[Sequence[str]] = None,
 ) -> Tuple[ClassifierBundle, pd.DataFrame]:
     """Train every candidate, return the best (by val accuracy) plus a leaderboard."""
     y_train_enc = encoder.transform(y_train)
     leaderboard: List[Dict[str, object]] = []
     best: Optional[ClassifierBundle] = None
 
-    for name, pipe, has_proba in _candidate_pipelines(C=C, n_train=len(X_train)):
+    for name, pipe, has_proba in _candidate_pipelines(C=C, n_train=len(X_train), skip=skip):
         
         try:
             print(f"[Stage 6]   - training '{name}' on {len(X_train)} samples...")
@@ -427,6 +437,7 @@ def run_stage6(
     panorama_paths: Optional[List[str]] = None,
     pano_segments: int = 6,
     panorama_limit: int = 1,
+    skip: Optional[Sequence[str]] = None,
 ) -> None:
     """
     Stage 6 pipeline (callable from main). Trains and benchmarks several
@@ -506,7 +517,7 @@ def run_stage6(
 
     print("[Stage 6] Benchmarking candidate classifiers (best for this domain wins)...")
     best, leaderboard = benchmark_and_select_best(
-        X_train, y_train, X_val, y_val, encoder=enc, C=C
+        X_train, y_train, X_val, y_val, encoder=enc, C=C, skip=skip
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -581,6 +592,7 @@ def run_stage6_cli(args: argparse.Namespace) -> None:
         panorama_paths=[_resolve(args.panorama)] if args.panorama else None,
         pano_segments=args.pano_segments,
         panorama_limit=1,
+        skip=args.skip or None,
     )
 
 
@@ -605,6 +617,13 @@ def parse_args():
     p.add_argument("--C", type=float, default=1.0, help="Regularization for SVC/LogReg")
     p.add_argument("--panorama", default=None, help="Optional panorama path for segment-based demo")
     p.add_argument("--pano-segments", type=int, default=6)
+    p.add_argument(
+        "--skip",
+        nargs="*",
+        default=[],
+        choices=["gaussian_nb", "logreg", "linear_svc", "random_forest", "rbf_svc"],
+        help="Classifier names to skip (e.g. --skip linear_svc).",
+    )
     return p.parse_args()
 
 
