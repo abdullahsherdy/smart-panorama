@@ -468,8 +468,7 @@ if __name__ == "__main__":
 
     
     try:
-        iou_df = evaluate_on_voc_binary_i
-        ou(
+        iou_df = evaluate_on_voc_binary_iou(
             voc_root=voc_root,
             n_samples=voc_samples,
             n_segments=args.segments,

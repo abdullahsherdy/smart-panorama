@@ -258,7 +258,7 @@ def _candidate_pipelines(
                             dual=False,
                             loss="squared_hinge",
                             tol=1e-3,
-                            max_iter=1000,
+                            max_iter=2000,
                             verbose=1,
                             random_state=42,
                         ),
