@@ -274,7 +274,7 @@ def _candidate_pipelines(
                     (
                         "clf",
                         RandomForestClassifier(
-                            n_estimators=300,
+                            n_estimators=200,
                             n_jobs=-1,
                             random_state=42,
                         ),
