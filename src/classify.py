@@ -11,7 +11,6 @@ Random Forest) and saves the best-scoring one as the final classifier.
 Confidence at inference time = softmax over decision_function scores
 (or predict_proba when natively available).
 """
-
 from __future__ import annotations
 
 import argparse
