@@ -1,0 +1,3 @@
+classifier,val_accuracy,note
+logreg,0.4312,
+random_forest,0.37,
